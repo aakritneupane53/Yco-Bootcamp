@@ -68,12 +68,10 @@ airflow-worker.pid
 # Temporary files
 tmp/
 temp/
-data/raw/
-data/processed/
+
 
 # Keep directory structure if needed
-!data/raw/.gitkeep
-!data/processed/.gitkeep
+
 
 # ==========================================
 # JUPYTER NOTEBOOKS
