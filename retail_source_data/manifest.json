@@ -1,0 +1,101 @@
+{
+  "test_dates": [
+    "2026-11-10",
+    "2026-11-11",
+    "2026-11-12",
+    "2026-11-13",
+    "2026-11-14"
+  ],
+  "csv_file_count": 22,
+  "csv_files": [
+    {
+      "file": "customer_master.csv",
+      "rows_excluding_header": 14
+    },
+    {
+      "file": "inventory_snapshot_20261110.csv",
+      "rows_excluding_header": 27
+    },
+    {
+      "file": "inventory_snapshot_20261111.csv",
+      "rows_excluding_header": 24
+    },
+    {
+      "file": "inventory_snapshot_20261112.csv",
+      "rows_excluding_header": 25
+    },
+    {
+      "file": "inventory_snapshot_20261113.csv",
+      "rows_excluding_header": 24
+    },
+    {
+      "file": "inventory_snapshot_20261114.csv",
+      "rows_excluding_header": 25
+    },
+    {
+      "file": "item_master_20261110.csv",
+      "rows_excluding_header": 10
+    },
+    {
+      "file": "item_master_20261111.csv",
+      "rows_excluding_header": 8
+    },
+    {
+      "file": "item_master_20261112.csv",
+      "rows_excluding_header": 8
+    },
+    {
+      "file": "item_master_20261113.csv",
+      "rows_excluding_header": 9
+    },
+    {
+      "file": "item_master_20261114.csv",
+      "rows_excluding_header": 8
+    },
+    {
+      "file": "pos_sales_20261110.csv",
+      "rows_excluding_header": 15
+    },
+    {
+      "file": "pos_sales_20261111.csv",
+      "rows_excluding_header": 14
+    },
+    {
+      "file": "pos_sales_20261112.csv",
+      "rows_excluding_header": 14
+    },
+    {
+      "file": "pos_sales_20261113.csv",
+      "rows_excluding_header": 14
+    },
+    {
+      "file": "pos_sales_20261114.csv",
+      "rows_excluding_header": 13
+    },
+    {
+      "file": "price_snapshot_20261110.csv",
+      "rows_excluding_header": 26
+    },
+    {
+      "file": "price_snapshot_20261111.csv",
+      "rows_excluding_header": 25
+    },
+    {
+      "file": "price_snapshot_20261112.csv",
+      "rows_excluding_header": 24
+    },
+    {
+      "file": "price_snapshot_20261113.csv",
+      "rows_excluding_header": 24
+    },
+    {
+      "file": "price_snapshot_20261114.csv",
+      "rows_excluding_header": 24
+    },
+    {
+      "file": "store_master_20261110.csv",
+      "rows_excluding_header": 4
+    }
+  ],
+  "total_csv_rows": 379
+}
