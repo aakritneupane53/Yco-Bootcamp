@@ -1,127 +1,28 @@
 
 import os
+import sys
 import re
 from datetime import timedelta
 
 import pendulum
 
 from airflow.decorators import dag, task
+from airflow.operators.python import get_current_context
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
-
-# --------------------------------------------------
-# CONFIGURATION
-# --------------------------------------------------
-
-DATA_DIR = "/opt/airflow/data"
-
-SNOWFLAKE_CONN_ID = "snowflake_default"
-
-DATABASE = "RETAIL_DB"
-SCHEMA = "STG"
-
-STAGE = f"{DATABASE}.{SCHEMA}.STG_RETAIL_SOURCE"
-FILE_FORMAT = f"{DATABASE}.{SCHEMA}.FF_RETAIL_CSV"
-INGESTION_LOG = f"{DATABASE}.{SCHEMA}.STG_INGESTION_LOG"
+sys.path.append("/opt/airflow/lib")
 
 
-# --------------------------------------------------
-# SOURCE FILE MAPPING
-# --------------------------------------------------
-
-SOURCE_CONFIG = [
-    {
-        "pattern": r"item_master_[0-9]{8}\.csv",
-        "folder": "item_master",
-        "table": "STG_ITEM_MASTER",
-        "columns": [
-            "ITEM_ID",
-            "ITEM_NAME",
-            "SUBCATEGORY_ID",
-            "SUBCATEGORY_NAME",
-            "CATEGORY_ID",
-            "CATEGORY_NAME",
-            "BRAND_ID",
-            "BRAND_NAME",
-            "UNIT_OF_MEASURE",
-            "ACTIVE_FLG",
-        ],
-    },
-    {
-        "pattern": r"store_master_[0-9]{8}\.csv",
-        "folder": "store_master",
-        "table": "STG_STORE_MASTER",
-        "columns": [
-            "STORE_ID",
-            "STORE_NAME",
-            "REGION_ID",
-            "REGION_NAME",
-            "COUNTRY_ID",
-            "COUNTRY_NAME",
-            "CITY",
-            "STORE_TYPE",
-            "ACTIVE_FLG",
-        ],
-    },
-    {
-        "pattern": r"pos_sales_[0-9]{8}\.csv",
-        "folder": "pos_sales",
-        "table": "STG_POS_SALES",
-        "columns": [
-            "TRANSACTION_ID",
-            "LINE_NUMBER",
-            "SALE_DATETIME",
-            "BUSINESS_DATE",
-            "STORE_ID",
-            "ITEM_ID",
-            "CUSTOMER_ID",
-            "SOLD_QTY",
-            "SELLING_PRICE_AMT",
-            "DISCOUNT_AMT",
-            "SALES_AMT",
-            "COST_AMT",
-        ],
-    },
-    {
-        "pattern": r"inventory_snapshot_[0-9]{8}\.csv",
-        "folder": "inventory_snapshot",
-        "table": "STG_INVENTORY_SNAPSHOT",
-        "columns": [
-            "BUSINESS_DATE",
-            "ITEM_ID",
-            "STORE_ID",
-            "ON_HAND_QTY",
-            "AVAILABLE_QTY",
-            "RESERVED_QTY",
-            "INVENTORY_VALUE_AMT",
-        ],
-    },
-    {
-        "pattern": r"price_snapshot_[0-9]{8}\.csv",
-        "folder": "price_snapshot",
-        "table": "STG_PRICE_SNAPSHOT",
-        "columns": [
-            "BUSINESS_DATE",
-            "ITEM_ID",
-            "STORE_ID",
-            "SELLING_PRICE_AMT",
-            "UNIT_COST_AMT",
-        ],
-    },
-    {
-        "pattern": r"customer_master\.csv",
-        "folder": "customer_master",
-        "table": "STG_CUSTOMER_MASTER",
-        "columns": [
-            "CUSTOMER_ID",
-            "CUSTOMER_NAME",
-            "CITY",
-            "LOYALTY_TIER",
-            "REGISTRATION_DATE",
-            "ACTIVE_FLG",
-        ],
-    },
-]
+from retail_ingestion_config import (
+    DATA_DIR,
+    SNOWFLAKE_CONN_ID,
+    DATABASE,
+    SCHEMA,
+    STAGE,
+    FILE_FORMAT,
+    INGESTION_LOG,
+    SOURCE_CONFIG,
+)
 
 
 # --------------------------------------------------
@@ -148,7 +49,7 @@ def sql_string(value):
 
 @dag(
     dag_id="retail_stg_ingestion",
-    description="Automatically ingest retail CSV files into Snowflake STG",
+    description="Retail CSV ingestion into Snowflake STG",
     schedule="*/5 * * * *",
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
@@ -162,6 +63,37 @@ def sql_string(value):
 )
 def retail_stg_ingestion():
 
+    # --------------------------------------------------
+    # TASK 1: TEST SNOWFLAKE CONNECTION
+    # --------------------------------------------------
+
+    @task
+    def test_snowflake_connection():
+
+        hook = SnowflakeHook(
+            snowflake_conn_id=SNOWFLAKE_CONN_ID
+        )
+
+        result = hook.get_first("""
+            SELECT
+                CURRENT_USER(),
+                CURRENT_ROLE(),
+                CURRENT_DATABASE(),
+                CURRENT_SCHEMA(),
+                CURRENT_WAREHOUSE(),
+                CURRENT_VERSION()
+        """)
+
+        if not result:
+            raise RuntimeError("Snowflake connection test returned no result")
+
+        print("Snowflake connection successful!")
+        print(f"Connection details: {result}")
+
+    # --------------------------------------------------
+    # TASK 2: INGEST NEW FILES
+    # --------------------------------------------------
+
     @task
     def ingest_new_files():
 
@@ -170,15 +102,12 @@ def retail_stg_ingestion():
                 f"Data directory not found: {DATA_DIR}"
             )
 
-        files = sorted(os.listdir(DATA_DIR))
-
-        # Only process completed CSV files.
-        csv_files = [
+        csv_files = sorted([
             filename
-            for filename in files
+            for filename in os.listdir(DATA_DIR)
             if filename.lower().endswith(".csv")
             and os.path.isfile(os.path.join(DATA_DIR, filename))
-        ]
+        ])
 
         if not csv_files:
             print("No CSV files found. Nothing to ingest.")
@@ -187,6 +116,9 @@ def retail_stg_ingestion():
         hook = SnowflakeHook(
             snowflake_conn_id=SNOWFLAKE_CONN_ID
         )
+
+        context = get_current_context()
+        batch_id = context["run_id"][:100]
 
         conn = hook.get_conn()
         cursor = conn.cursor()
@@ -207,10 +139,10 @@ def retail_stg_ingestion():
                     f"{DATABASE}.{SCHEMA}.{config['table']}"
                 )
 
-                print(f"Processing file: {filename}")
+                print(f"Processing: {filename}")
 
                 # ----------------------------------
-                # 1. CHECK INGESTION LOG
+                # CHECK INGESTION LOG
                 # ----------------------------------
 
                 cursor.execute(
@@ -224,16 +156,14 @@ def retail_stg_ingestion():
                     (filename, target_table),
                 )
 
-                already_loaded = cursor.fetchone()[0] > 0
-
-                if already_loaded:
-                    print(f"Already loaded. Skipping: {filename}")
+                if cursor.fetchone()[0] > 0:
+                    print(f"Already loaded: {filename}")
                     continue
 
                 try:
 
                     # ----------------------------------
-                    # 2. UPLOAD FILE TO SNOWFLAKE STAGE
+                    # UPLOAD FILE TO INTERNAL STAGE
                     # ----------------------------------
 
                     local_file = os.path.join(
@@ -242,19 +172,19 @@ def retail_stg_ingestion():
 
                     stage_folder = config["folder"]
 
-                    put_sql = f"""
-                    PUT {sql_string("file://" + local_file)}
-                    @{STAGE}/{stage_folder}/
-                    AUTO_COMPRESS = FALSE
-                    OVERWRITE = FALSE
-                    """
+                    put_sql = (
+                        f"PUT file://{local_file} "
+                        f"@{STAGE}/{stage_folder}/ "
+                        "AUTO_COMPRESS=FALSE "
+                        "OVERWRITE=FALSE"
+                    )
 
                     cursor.execute(put_sql)
 
-                    print(f"Uploaded to stage: {filename}")
+                    print(f"Uploaded: {filename}")
 
                     # ----------------------------------
-                    # 3. BUILD COPY INTO QUERY
+                    # BUILD COPY INTO QUERY
                     # ----------------------------------
 
                     source_columns = ", ".join(
@@ -263,8 +193,7 @@ def retail_stg_ingestion():
                     )
 
                     target_columns = ", ".join(
-                        config["columns"]
-                        + [
+                        config["columns"] + [
                             "SRC_FILE_NM",
                             "ROW_NUM",
                             "INGEST_TS",
@@ -272,29 +201,19 @@ def retail_stg_ingestion():
                         ]
                     )
 
-                    batch_id = sql_string(
-                        os.environ.get(
-                            "AIRFLOW_CTX_DAG_RUN_ID",
-                            "manual_run",
-                        )[:100]
-                    )
-
                     copy_sql = f"""
                     COPY INTO {target_table}
                     ({target_columns})
-
                     FROM (
                         SELECT
                             {source_columns},
                             METADATA$FILENAME::VARCHAR,
                             METADATA$FILE_ROW_NUMBER::NUMBER,
                             METADATA$START_SCAN_TIME::TIMESTAMP_NTZ,
-                            {batch_id}
-
+                            {sql_string(batch_id)}
                         FROM @{STAGE}/{stage_folder}/{filename}
                             (FILE_FORMAT => '{FILE_FORMAT}')
                     )
-
                     FORCE = FALSE
                     ON_ERROR = 'ABORT_STATEMENT'
                     """
@@ -303,11 +222,10 @@ def retail_stg_ingestion():
 
                     copy_results = cursor.fetchall()
 
-                    print(f"COPY completed for: {filename}")
                     print(f"COPY results: {copy_results}")
 
                     # ----------------------------------
-                    # 4. RECORD SUCCESS
+                    # RECORD SUCCESS
                     # ----------------------------------
 
                     cursor.execute(
@@ -320,23 +238,20 @@ def retail_stg_ingestion():
                             LOAD_TS,
                             ERROR_MESSAGE
                         )
-                        VALUES (%s, %s, %s, CURRENT_TIMESTAMP(), NULL)
+                        VALUES (%s, %s, 'SUCCESS',
+                                CURRENT_TIMESTAMP(), NULL)
                         """,
-                        (
-                            filename,
-                            target_table,
-                            "SUCCESS",
-                        ),
+                        (filename, target_table),
                     )
 
-                    print(f"SUCCESS: {filename}")
+                    print(f"Successfully ingested: {filename}")
 
                 except Exception as file_error:
 
                     error_message = str(file_error)[:2000]
 
                     # ----------------------------------
-                    # 5. RECORD FAILURE
+                    # RECORD FAILURE
                     # ----------------------------------
 
                     cursor.execute(
@@ -349,21 +264,17 @@ def retail_stg_ingestion():
                             LOAD_TS,
                             ERROR_MESSAGE
                         )
-                        VALUES (%s, %s, %s, CURRENT_TIMESTAMP(), %s)
+                        VALUES (%s, %s, 'FAILED',
+                                CURRENT_TIMESTAMP(), %s)
                         """,
-                        (
-                            filename,
-                            target_table,
-                            "FAILED",
-                            error_message,
-                        ),
+                        (filename, target_table, error_message),
                     )
 
                     errors.append(
                         f"{filename}: {error_message}"
                     )
 
-                    print(f"FAILED: {filename}")
+                    print(f"Failed: {filename}")
                     print(error_message)
 
         finally:
@@ -372,10 +283,16 @@ def retail_stg_ingestion():
 
         if errors:
             raise RuntimeError(
-                "One or more files failed:\n" + "\n".join(errors)
+                "One or more files failed:\n"
+                + "\n".join(errors)
             )
 
-    ingest_new_files()
+
+    connection_test = test_snowflake_connection()
+
+    ingestion = ingest_new_files()
+
+    connection_test >> ingestion
 
 
 retail_stg_ingestion()
