@@ -1,31 +1,43 @@
-
 # --------------------------------------------------
 # GENERAL CONFIGURATION
 # --------------------------------------------------
 
 DATA_DIR = "/opt/airflow/data"
 
+# SQL files are mounted from the project-root sql/ directory
+# into every Airflow container at /opt/airflow/sql.
+SQL_DIR = "/opt/airflow/sql/silver"
+
 SNOWFLAKE_CONN_ID = "snowflake_default"
 
 DATABASE = "RETAIL_DB"
+
+# Bronze / staging layer
 SCHEMA = "STG"
-
 STAGE = f"{DATABASE}.{SCHEMA}.STG_RETAIL_SOURCE"
-
 FILE_FORMAT = f"{DATABASE}.{SCHEMA}.FF_RETAIL_CSV"
-
 INGESTION_LOG = f"{DATABASE}.{SCHEMA}.STG_INGESTION_LOG"
+
+# Silver layer
+SILVER_SCHEMA = "TMP"
+SILVER_LOAD_CONTROL = (
+    f"{DATABASE}.{SILVER_SCHEMA}.SILVER_LOAD_CONTROL"
+)
 
 
 # --------------------------------------------------
 # SOURCE FILE CONFIGURATION
 # --------------------------------------------------
+# silver_sql_file points to a standalone SQL file in SQL_DIR.
+# The SQL files remain separate from Python DAG code.
 
 SOURCE_CONFIG = [
     {
         "pattern": r"item_master_[0-9]{8}\.csv",
         "folder": "item_master",
         "table": "STG_ITEM_MASTER",
+        "silver_table": "SILVER_ITEM_MASTER",
+        "silver_sql_file": "01_load_item_master.sql",
         "columns": [
             "ITEM_ID",
             "ITEM_NAME",
@@ -43,6 +55,8 @@ SOURCE_CONFIG = [
         "pattern": r"store_master_[0-9]{8}\.csv",
         "folder": "store_master",
         "table": "STG_STORE_MASTER",
+        "silver_table": "SILVER_STORE_MASTER",
+        "silver_sql_file": "02_load_store_master.sql",
         "columns": [
             "STORE_ID",
             "STORE_NAME",
@@ -59,6 +73,8 @@ SOURCE_CONFIG = [
         "pattern": r"pos_sales_[0-9]{8}\.csv",
         "folder": "pos_sales",
         "table": "STG_POS_SALES",
+        "silver_table": "SILVER_POS_SALES",
+        "silver_sql_file": "04_load_pos_sales.sql",
         "columns": [
             "TRANSACTION_ID",
             "LINE_NUMBER",
@@ -78,6 +94,8 @@ SOURCE_CONFIG = [
         "pattern": r"inventory_snapshot_[0-9]{8}\.csv",
         "folder": "inventory_snapshot",
         "table": "STG_INVENTORY_SNAPSHOT",
+        "silver_table": "SILVER_INVENTORY_SNAPSHOT",
+        "silver_sql_file": "05_load_inventory_snapshot.sql",
         "columns": [
             "BUSINESS_DATE",
             "ITEM_ID",
@@ -92,6 +110,8 @@ SOURCE_CONFIG = [
         "pattern": r"price_snapshot_[0-9]{8}\.csv",
         "folder": "price_snapshot",
         "table": "STG_PRICE_SNAPSHOT",
+        "silver_table": "SILVER_PRICE_SNAPSHOT",
+        "silver_sql_file": "06_load_price_snapshot.sql",
         "columns": [
             "BUSINESS_DATE",
             "ITEM_ID",
@@ -104,6 +124,8 @@ SOURCE_CONFIG = [
         "pattern": r"customer_master\.csv",
         "folder": "customer_master",
         "table": "STG_CUSTOMER_MASTER",
+        "silver_table": "SILVER_CUSTOMER_MASTER",
+        "silver_sql_file": "03_load_customer_master.sql",
         "columns": [
             "CUSTOMER_ID",
             "CUSTOMER_NAME",
