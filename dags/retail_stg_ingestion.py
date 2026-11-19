@@ -2,6 +2,7 @@ import hashlib
 import os
 import re
 import sys
+import time
 from datetime import timedelta
 from io import StringIO
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 import pendulum
 
 # Airflow SDK imports
-from airflow.sdk import dag, task, get_current_context
+from airflow.sdk import dag, task, get_current_context, PokeReturnValue
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
 sys.path.append("/opt/airflow/lib")
@@ -27,6 +28,19 @@ from retail_ingestion_config import (
     SILVER_LOAD_CONTROL,
     SOURCE_CONFIG,
 )
+
+
+# --------------------------------------------------
+# FILE ARRIVAL SENSOR SETTINGS
+# --------------------------------------------------
+# The sensor waits for at least one stable CSV file for EVERY source type
+# declared in SOURCE_CONFIG. It does not check whether files are new or
+# previously ingested: existing files must satisfy the arrival barrier too.
+# Ingestion idempotency is handled separately by the checksum log.
+EXPECTED_SOURCE_TABLES = {item["table"] for item in SOURCE_CONFIG}
+FILE_SENSOR_POKE_INTERVAL_SECONDS = 30
+FILE_SENSOR_TIMEOUT_SECONDS = 60 * 60  # 1 hour
+FILE_STABILITY_SECONDS = 30
 
 
 # --------------------------------------------------
@@ -334,8 +348,8 @@ def record_silver_failure(
 @dag(
     dag_id="retail_stg_ingestion",
     description=(
-        "Discover retail CSV files, ingest into Bronze, process pending "
-        "Bronze files into Silver, and verify Silver audit results"
+        "Wait for the required retail CSV batch, dynamically ingest each file "
+        "into Bronze in parallel, process pending files into Silver, and audit results"
     ),
     schedule="*/5 * * * *",
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
@@ -346,7 +360,7 @@ def record_silver_failure(
         "retries": 1,
         "retry_delay": timedelta(minutes=2),
     },
-    tags=["retail", "snowflake", "bronze", "silver"],
+    tags=["retail", "snowflake", "sensors", "dynamic-mapping", "bronze", "silver"],
 )
 def retail_stg_ingestion():
 
@@ -395,289 +409,432 @@ def retail_stg_ingestion():
             conn.close()
 
     # --------------------------------------------------
-    # 2. INGEST NEW CSV FILES INTO BRONZE
+    # 2. WAIT FOR THE REQUIRED FILE ARRIVAL BATCH
+    # --------------------------------------------------
+
+    @task.sensor(
+        task_id="wait_for_required_files",
+        poke_interval=FILE_SENSOR_POKE_INTERVAL_SECONDS,
+        timeout=FILE_SENSOR_TIMEOUT_SECONDS,
+        mode="reschedule",
+    )
+    def wait_for_required_files():
+        """Wait for one stable local CSV file for every configured source type.
+
+        Existing files count, whether or not they were ingested in a previous
+        DAG run. The sensor only checks local file presence/stability; the
+        ingestion task later uses checksums to skip unchanged files.
+        """
+        data_path = Path(DATA_DIR)
+        if not data_path.is_dir():
+            print(f"Waiting for data directory to become available: {DATA_DIR}")
+            return PokeReturnValue(is_done=False)
+
+        now = time.time()
+        stable_by_source = {source_table: [] for source_table in EXPECTED_SOURCE_TABLES}
+        unstable_by_source = {source_table: [] for source_table in EXPECTED_SOURCE_TABLES}
+
+        for file_path in sorted(data_path.iterdir()):
+            if not file_path.is_file() or file_path.suffix.lower() != ".csv":
+                continue
+
+            config = identify_file(file_path.name)
+            if config is None:
+                print(f"Ignoring unsupported CSV while sensing: {file_path.name}")
+                continue
+
+            source_table = config["table"]
+            try:
+                stat = file_path.stat()
+            except FileNotFoundError:
+                # A producer may still be moving/renaming the file.
+                continue
+
+            if stat.st_size <= 0:
+                unstable_by_source[source_table].append(
+                    f"{file_path.name} (empty)"
+                )
+                continue
+
+            age_seconds = now - stat.st_mtime
+            if age_seconds < FILE_STABILITY_SECONDS:
+                unstable_by_source[source_table].append(
+                    f"{file_path.name} ({age_seconds:.1f}s old)"
+                )
+                continue
+
+            try:
+                # Confirms the file did not change while it was being read.
+                calculate_file_identity(file_path)
+            except (FileNotFoundError, RuntimeError) as file_error:
+                unstable_by_source[source_table].append(
+                    f"{file_path.name} ({file_error})"
+                )
+                continue
+
+            stable_by_source[source_table].append(file_path.name)
+
+        missing_sources = sorted(
+            source_table
+            for source_table, filenames in stable_by_source.items()
+            if not filenames
+        )
+
+        if missing_sources:
+            details = []
+            for source_table in missing_sources:
+                config = next(
+                    item for item in SOURCE_CONFIG
+                    if item["table"] == source_table
+                )
+                details.append(
+                    f"{source_table} pattern={config['pattern']!r}; "
+                    f"unstable={unstable_by_source[source_table]}"
+                )
+            print(
+                "Waiting for at least one stable file for every configured "
+                f"CSV type. Missing types: {' | '.join(details)}"
+            )
+            return PokeReturnValue(is_done=False)
+
+        # Map every stable supported file currently present, not just one file
+        # per type. This permits multiple dated snapshots/files for a source.
+        ready_file_names = sorted(
+            filename
+            for filenames in stable_by_source.values()
+            for filename in filenames
+        )
+        print(
+            "File arrival barrier passed. Stable files by source type: "
+            + str(stable_by_source)
+        )
+        return PokeReturnValue(
+            is_done=True,
+            xcom_value=ready_file_names,
+        )
+
+    # --------------------------------------------------
+    # 3. PREPARE THE INGESTION LOG ONCE BEFORE PARALLEL TASKS
     # --------------------------------------------------
 
     @task
-    def ingest_new_files():
-        data_path = Path(DATA_DIR)
+    def prepare_ingestion_log():
+        """Apply the backward-compatible log-column migration once."""
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        conn = hook.get_conn()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f"USE WAREHOUSE {WAREHOUSE}")
+            ensure_ingestion_log_columns(cursor)
+            print(f"Ingestion log is ready: {INGESTION_LOG}")
+        finally:
+            cursor.close()
+            conn.close()
 
-        if not data_path.is_dir():
-            raise FileNotFoundError(
-                f"Data directory not found: {DATA_DIR}"
+    # --------------------------------------------------
+    # 4. DISCOVER FILES TO BE DYNAMICALLY MAPPED
+    # --------------------------------------------------
+
+    @task
+    def discover_files_for_mapping(sensor_file_names):
+        """Return one mapping payload per ready supported CSV file."""
+        data_path = Path(DATA_DIR)
+        file_infos = []
+
+        for filename in sensor_file_names:
+            file_path = data_path / filename
+            if not file_path.is_file():
+                raise FileNotFoundError(
+                    f"File disappeared after sensor completed: {file_path}"
+                )
+
+            config = identify_file(filename)
+            if config is None:
+                # The file may have changed between the sensor and discovery.
+                print(f"Unsupported file ignored after sensor: {filename}")
+                continue
+
+            file_infos.append({
+                "filename": filename,
+                "file_path": str(file_path),
+                "source_table": config["table"],
+            })
+
+        covered_source_tables = {item["source_table"] for item in file_infos}
+        missing_source_tables = sorted(EXPECTED_SOURCE_TABLES - covered_source_tables)
+        if missing_source_tables:
+            raise RuntimeError(
+                "The file set changed after the sensor passed. Missing at least "
+                "one file for these configured source types: "
+                + ", ".join(missing_source_tables)
             )
 
-        # Source CSVs are placed directly in the project's data/ folder.
-        csv_files = sorted(
-            p for p in data_path.iterdir()
-            if p.is_file() and p.suffix.lower() == ".csv"
+        print(
+            f"Creating {len(file_infos)} dynamically mapped ingestion task(s): "
+            f"{[item['filename'] for item in file_infos]}"
         )
+        return file_infos
+
+    # --------------------------------------------------
+    # 5. ONE BRONZE INGESTION TASK PER FILE (DYNAMIC MAPPING)
+    # --------------------------------------------------
+
+    @task(
+        task_id="ingest_single_file",
+        retries=1,
+        retry_delay=timedelta(minutes=2),
+    )
+    def ingest_single_file(file_info):
+        """Ingest exactly one CSV file. Airflow maps this task per file."""
+        filename = file_info["filename"]
+        file_path = Path(file_info["file_path"])
+        config = identify_file(filename)
+
+        if config is None:
+            return {
+                "status": "UNSUPPORTED",
+                "filename": filename,
+                "error": "No SOURCE_CONFIG pattern matched this file.",
+            }
+
+        if not file_path.is_file():
+            return {
+                "status": "FAILED",
+                "filename": filename,
+                "target_table": config["table"],
+                "error": f"Local file no longer exists: {file_path}",
+            }
+
+        # Recheck stability immediately before reading/uploading the file.
+        current_age = time.time() - file_path.stat().st_mtime
+        if current_age < FILE_STABILITY_SECONDS:
+            return {
+                "status": "FAILED",
+                "filename": filename,
+                "target_table": config["table"],
+                "error": (
+                    f"File was modified after the sensor check and is not yet "
+                    f"stable ({current_age:.1f}s old)."
+                ),
+            }
 
         context = get_current_context()
-        airflow_run_id = context["run_id"][:250]
         batch_id = context["run_id"][:100]
+        target_table = f"{DATABASE}.{BRONZE_SCHEMA}.{config['table']}"
 
+        file_identity = None
+        conn = None
+        cursor = None
+        result = None
+
+        try:
+            file_identity = calculate_file_identity(file_path)
+            if file_identity["size_bytes"] == 0:
+                raise ValueError(
+                    "Empty CSV file detected; ingestion was not attempted."
+                )
+
+            hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+            conn = hook.get_conn()
+            cursor = conn.cursor()
+            cursor.execute(f"USE WAREHOUSE {WAREHOUSE}")
+
+            # Same filename + same bytes is already ingested.
+            cursor.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {INGESTION_LOG}
+                WHERE FILE_NAME = %s
+                  AND TARGET_TABLE = %s
+                  AND FILE_CHECKSUM = %s
+                  AND LOAD_STATUS = 'SUCCESS'
+                """,
+                (filename, target_table, file_identity["sha256"]),
+            )
+            if int(cursor.fetchone()[0] or 0) > 0:
+                print(f"Already ingested (same checksum): {filename}")
+                return {
+                    "status": "ALREADY_INGESTED",
+                    "filename": filename,
+                    "target_table": config["table"],
+                    "checksum": file_identity["sha256"],
+                    "size_bytes": file_identity["size_bytes"],
+                }
+
+            # Backward compatibility for successful rows created before
+            # checksum columns were introduced.
+            if legacy_stage_file_matches(
+                cursor, config, filename, file_identity
+            ):
+                return {
+                    "status": "ALREADY_INGESTED",
+                    "filename": filename,
+                    "target_table": config["table"],
+                    "checksum": file_identity["sha256"],
+                    "size_bytes": file_identity["size_bytes"],
+                }
+
+            filename_stem = filename.rsplit(".", 1)[0]
+            stage_version_dir = (
+                f"{config['folder']}/{filename_stem}/"
+                f"{file_identity['sha256']}"
+            )
+
+            put_sql = (
+                f"PUT {sql_string('file://' + str(file_path.resolve()))} "
+                f"@{STAGE}/{stage_version_dir}/ "
+                "AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
+            )
+            cursor.execute(put_sql)
+            put_results = cursor.fetchall()
+            print(f"PUT results for {filename}: {put_results}")
+
+            source_columns = ", ".join(
+                f"${index + 1}" for index in range(len(config["columns"]))
+            )
+            target_columns = ", ".join(
+                config["columns"] + [
+                    "SRC_FILE_NM", "ROW_NUM", "INGEST_TS", "BATCH_ID"
+                ]
+            )
+            staged_file_path = f"@{STAGE}/{stage_version_dir}/{filename}"
+
+            copy_sql = f"""
+                COPY INTO {target_table} ({target_columns})
+                FROM (
+                    SELECT
+                        {source_columns},
+                        METADATA$FILENAME::VARCHAR,
+                        METADATA$FILE_ROW_NUMBER::NUMBER,
+                        METADATA$START_SCAN_TIME::TIMESTAMP_NTZ,
+                        {sql_string(batch_id)}
+                    FROM {staged_file_path}
+                        (FILE_FORMAT => '{FILE_FORMAT}')
+                )
+                FORCE = FALSE
+                ON_ERROR = 'ABORT_STATEMENT'
+            """
+            cursor.execute(copy_sql)
+            copy_results = cursor.fetchall()
+            print(f"COPY results for {filename}: {copy_results}")
+
+            failed_copy_rows = [
+                row for row in copy_results
+                if len(row) > 1 and str(row[1]).upper() in {
+                    "LOAD_FAILED", "PARTIALLY_LOADED"
+                }
+            ]
+            if failed_copy_rows:
+                raise RuntimeError(
+                    f"COPY reported failed rows: {failed_copy_rows}"
+                )
+
+            cursor.execute(
+                f"""
+                INSERT INTO {INGESTION_LOG} (
+                    FILE_NAME, TARGET_TABLE, LOAD_STATUS, LOAD_TS,
+                    ERROR_MESSAGE, FILE_CHECKSUM, FILE_SIZE_BYTES
+                )
+                VALUES (%s, %s, 'SUCCESS', CURRENT_TIMESTAMP(), NULL, %s, %s)
+                """,
+                (
+                    filename,
+                    target_table,
+                    file_identity["sha256"],
+                    file_identity["size_bytes"],
+                ),
+            )
+
+            result = {
+                "status": "INGESTED",
+                "filename": filename,
+                "target_table": config["table"],
+                "checksum": file_identity["sha256"],
+                "size_bytes": file_identity["size_bytes"],
+            }
+            print(f"Successfully ingested {filename} into {target_table}")
+
+        except Exception as file_error:
+            error_message = str(file_error)[:2000]
+            print(f"Failed to ingest {filename}: {error_message}")
+
+            # Persist failure for this file. The next DAG run retries it.
+            if cursor is not None:
+                try:
+                    checksum = (
+                        file_identity["sha256"] if file_identity else None
+                    )
+                    size_bytes = (
+                        file_identity["size_bytes"] if file_identity else None
+                    )
+                    cursor.execute(
+                        f"""
+                        INSERT INTO {INGESTION_LOG} (
+                            FILE_NAME, TARGET_TABLE, LOAD_STATUS, LOAD_TS,
+                            ERROR_MESSAGE, FILE_CHECKSUM, FILE_SIZE_BYTES
+                        )
+                        VALUES (%s, %s, 'FAILED', CURRENT_TIMESTAMP(), %s, %s, %s)
+                        """,
+                        (
+                            filename, target_table, error_message,
+                            checksum, size_bytes,
+                        ),
+                    )
+                except Exception as log_error:
+                    error_message += (
+                        f" | Could not write failure log: {log_error}"
+                    )
+
+            result = {
+                "status": "FAILED",
+                "filename": filename,
+                "target_table": config["table"],
+                "error": error_message,
+            }
+
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if conn is not None:
+                conn.close()
+
+        return result
+
+    # --------------------------------------------------
+    # 6. COLLECT RESULTS FROM THE MAPPED INGESTION TASKS
+    # --------------------------------------------------
+
+    @task
+    def summarize_ingestion(mapped_results):
+        # Airflow supplies mapped XCom values as a lazy sequence.
+        mapped_results = list(mapped_results)
         summary = {
-            "discovered": len(csv_files),
+            "discovered": len(mapped_results),
             "ingested": [],
             "already_ingested": [],
             "unsupported": [],
             "failed": [],
         }
 
-        if not csv_files:
-            print("No CSV files found in the data directory.")
-            return summary
-
-        hook = SnowflakeHook(
-            snowflake_conn_id=SNOWFLAKE_CONN_ID
-        )
-        conn = hook.get_conn()
-        cursor = conn.cursor()
-
-        try:
-            cursor.execute(f"USE WAREHOUSE {WAREHOUSE}")
-
-            # Upgrade the existing filename-only log once, without requiring
-            # the user to manually drop or recreate the control table.
-            ensure_ingestion_log_columns(cursor)
-
-            for file_path in csv_files:
-                filename = file_path.name
-                config = identify_file(filename)
-
-                if config is None:
-                    print(f"Unsupported CSV skipped: {filename}")
-                    summary["unsupported"].append(filename)
-                    continue
-
-                target_table = (
-                    f"{DATABASE}.{BRONZE_SCHEMA}.{config['table']}"
-                )
-
-                file_identity = None
-                try:
-                    file_identity = calculate_file_identity(file_path)
-
-                    if file_identity["size_bytes"] == 0:
-                        raise ValueError(
-                            "Empty CSV file detected; ingestion was not attempted."
-                        )
-
-                    # Checksum-based idempotency: same filename + same bytes
-                    # is a duplicate arrival; changed bytes are a new version.
-                    cursor.execute(
-                        f"""
-                        SELECT COUNT(*)
-                        FROM {INGESTION_LOG}
-                        WHERE FILE_NAME = %s
-                          AND TARGET_TABLE = %s
-                          AND FILE_CHECKSUM = %s
-                          AND LOAD_STATUS = 'SUCCESS'
-                        """,
-                        (
-                            filename,
-                            target_table,
-                            file_identity["sha256"],
-                        ),
-                    )
-
-                    if int(cursor.fetchone()[0] or 0) > 0:
-                        print(
-                            f"Already ingested (same checksum): {filename}"
-                        )
-                        summary["already_ingested"].append(filename)
-                        continue
-
-                    # Compatibility for success rows written by the old DAG,
-                    # which only tracked filename and did not store checksum.
-                    if legacy_stage_file_matches(
-                        cursor,
-                        config,
-                        filename,
-                        file_identity,
-                    ):
-                        summary["already_ingested"].append(filename)
-                        continue
-
-                    # Include the original filename before the checksum in
-                    # the stage path. The Item/Store SQL derives SNAPSHOT_DT
-                    # from the first YYYYMMDD in SRC_FILE_NM.
-                    #
-                    # A new file version gets a new stage path, so Snowflake's
-                    # COPY file-load metadata cannot mistake it for the old
-                    # bytes that used the same local filename.
-                    filename_stem = filename.rsplit(".", 1)[0]
-                    stage_version_dir = (
-                        f"{config['folder']}/{filename_stem}/"
-                        f"{file_identity['sha256']}"
-                    )
-
-                    put_sql = (
-                        f"PUT {sql_string('file://' + str(file_path.resolve()))} "
-                        f"@{STAGE}/{stage_version_dir}/ "
-                        "AUTO_COMPRESS=FALSE "
-                        "OVERWRITE=TRUE"
-                    )
-
-                    cursor.execute(put_sql)
-                    put_results = cursor.fetchall()
-                    print(f"PUT results for {filename}: {put_results}")
-
-                    source_columns = ", ".join(
-                        f"${index + 1}"
-                        for index in range(len(config["columns"]))
-                    )
-
-                    target_columns = ", ".join(
-                        config["columns"] + [
-                            "SRC_FILE_NM",
-                            "ROW_NUM",
-                            "INGEST_TS",
-                            "BATCH_ID",
-                        ]
-                    )
-
-                    staged_file_path = (
-                        f"@{STAGE}/{stage_version_dir}/{filename}"
-                    )
-
-                    copy_sql = f"""
-                        COPY INTO {target_table} ({target_columns})
-                        FROM (
-                            SELECT
-                                {source_columns},
-                                METADATA$FILENAME::VARCHAR,
-                                METADATA$FILE_ROW_NUMBER::NUMBER,
-                                METADATA$START_SCAN_TIME::TIMESTAMP_NTZ,
-                                {sql_string(batch_id)}
-                            FROM {staged_file_path}
-                                (FILE_FORMAT => '{FILE_FORMAT}')
-                        )
-                        FORCE = FALSE
-                        ON_ERROR = 'ABORT_STATEMENT'
-                    """
-
-                    cursor.execute(copy_sql)
-                    copy_results = cursor.fetchall()
-                    print(f"COPY results for {filename}: {copy_results}")
-
-                    failed_copy_rows = [
-                        row for row in copy_results
-                        if len(row) > 1
-                        and str(row[1]).upper() in {
-                            "LOAD_FAILED",
-                            "PARTIALLY_LOADED",
-                        }
-                    ]
-                    if failed_copy_rows:
-                        raise RuntimeError(
-                            f"COPY reported failed rows: {failed_copy_rows}"
-                        )
-
-                    cursor.execute(
-                        f"""
-                        INSERT INTO {INGESTION_LOG} (
-                            FILE_NAME,
-                            TARGET_TABLE,
-                            LOAD_STATUS,
-                            LOAD_TS,
-                            ERROR_MESSAGE,
-                            FILE_CHECKSUM,
-                            FILE_SIZE_BYTES
-                        )
-                        VALUES (
-                            %s, %s, 'SUCCESS',
-                            CURRENT_TIMESTAMP(), NULL, %s, %s
-                        )
-                        """,
-                        (
-                            filename,
-                            target_table,
-                            file_identity["sha256"],
-                            file_identity["size_bytes"],
-                        ),
-                    )
-
-                    summary["ingested"].append({
-                        "filename": filename,
-                        "target_table": config["table"],
-                        "checksum": file_identity["sha256"],
-                        "size_bytes": file_identity["size_bytes"],
-                    })
-
-                    print(
-                        f"Successfully ingested {filename} into {target_table}"
-                    )
-
-                except Exception as file_error:
-                    error_message = str(file_error)[:2000]
-
-                    # Record the failed version. A later DAG run retries it
-                    # because only SUCCESS entries are treated as complete.
-                    try:
-                        checksum = (
-                            file_identity["sha256"]
-                            if file_identity is not None
-                            else None
-                        )
-                        size_bytes = (
-                            file_identity["size_bytes"]
-                            if file_identity is not None
-                            else None
-                        )
-
-                        cursor.execute(
-                            f"""
-                            INSERT INTO {INGESTION_LOG} (
-                                FILE_NAME,
-                                TARGET_TABLE,
-                                LOAD_STATUS,
-                                LOAD_TS,
-                                ERROR_MESSAGE,
-                                FILE_CHECKSUM,
-                                FILE_SIZE_BYTES
-                            )
-                            VALUES (
-                                %s, %s, 'FAILED',
-                                CURRENT_TIMESTAMP(), %s, %s, %s
-                            )
-                            """,
-                            (
-                                filename,
-                                target_table,
-                                error_message,
-                                checksum,
-                                size_bytes,
-                            ),
-                        )
-                    except Exception as log_error:
-                        error_message += (
-                            f" | Could not write failure log: {log_error}"
-                        )
-
-                    summary["failed"].append({
-                        "filename": filename,
-                        "target_table": config["table"],
-                        "error": error_message,
-                    })
-                    print(f"Failed to ingest {filename}: {error_message}")
-
-        finally:
-            cursor.close()
-            conn.close()
+        for item in mapped_results:
+            status = item.get("status")
+            if status == "INGESTED":
+                summary["ingested"].append(item)
+            elif status == "ALREADY_INGESTED":
+                summary["already_ingested"].append(item)
+            elif status == "UNSUPPORTED":
+                summary["unsupported"].append(item["filename"])
+            elif status == "FAILED":
+                summary["failed"].append(item)
 
         print(
-            "Bronze ingestion summary: "
+            "Parallel Bronze ingestion summary: "
             f"discovered={summary['discovered']}, "
             f"ingested={len(summary['ingested'])}, "
             f"already_ingested={len(summary['already_ingested'])}, "
             f"unsupported={len(summary['unsupported'])}, "
             f"failed={len(summary['failed'])}"
         )
-
-        # Do not raise here. The next tasks should still process files that
-        # were successfully ingested, even if a different file failed.
         return summary
 
     # --------------------------------------------------
@@ -1087,7 +1244,11 @@ def retail_stg_ingestion():
     # --------------------------------------------------
 
     connection_test = test_snowflake_connection()
-    bronze_ingestion = ingest_new_files()
+    file_sensor = wait_for_required_files()
+    ingestion_log_ready = prepare_ingestion_log()
+    files_to_map = discover_files_for_mapping(file_sensor)
+    mapped_ingestion = ingest_single_file.expand(file_info=files_to_map)
+    bronze_ingestion = summarize_ingestion(mapped_ingestion)
     pending_files = identify_pending_silver_files(bronze_ingestion)
     silver_execution = execute_silver_sql_files(pending_files)
     silver_audit = confirm_silver_processing(
@@ -1096,13 +1257,10 @@ def retail_stg_ingestion():
         silver_execution,
     )
 
-    (
-        connection_test
-        >> bronze_ingestion
-        >> pending_files
-        >> silver_execution
-        >> silver_audit
-    )
+    connection_test >> ingestion_log_ready >> file_sensor
+    file_sensor >> files_to_map >> mapped_ingestion
+    mapped_ingestion >> bronze_ingestion
+    bronze_ingestion >> pending_files >> silver_execution >> silver_audit
 
 
 retail_stg_ingestion()
