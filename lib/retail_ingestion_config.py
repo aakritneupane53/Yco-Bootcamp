@@ -1,3 +1,4 @@
+
 # --------------------------------------------------
 # GENERAL CONFIGURATION
 # --------------------------------------------------
@@ -11,15 +12,28 @@ SQL_DIR = "/opt/airflow/sql/silver"
 SNOWFLAKE_CONN_ID = "snowflake_default"
 
 DATABASE = "RETAIL_DB"
+WAREHOUSE = "RETAIL_WH"
 
-# Bronze / staging layer
-SCHEMA = "STG"
-STAGE = f"{DATABASE}.{SCHEMA}.STG_RETAIL_SOURCE"
-FILE_FORMAT = f"{DATABASE}.{SCHEMA}.FF_RETAIL_CSV"
-INGESTION_LOG = f"{DATABASE}.{SCHEMA}.STG_INGESTION_LOG"
+# --------------------------------------------------
+# BRONZE / STAGING LAYER
+# --------------------------------------------------
 
-# Silver layer
+BRONZE_SCHEMA = "STG"
+
+STAGE = f"{DATABASE}.{BRONZE_SCHEMA}.STG_RETAIL_SOURCE"
+FILE_FORMAT = f"{DATABASE}.{BRONZE_SCHEMA}.FF_RETAIL_CSV"
+INGESTION_LOG = f"{DATABASE}.{BRONZE_SCHEMA}.STG_INGESTION_LOG"
+
+# Backward-compatible alias in case an older DAG
+# still imports SCHEMA.
+SCHEMA = BRONZE_SCHEMA
+
+# --------------------------------------------------
+# SILVER LAYER
+# --------------------------------------------------
+
 SILVER_SCHEMA = "TMP"
+
 SILVER_LOAD_CONTROL = (
     f"{DATABASE}.{SILVER_SCHEMA}.SILVER_LOAD_CONTROL"
 )
@@ -28,8 +42,6 @@ SILVER_LOAD_CONTROL = (
 # --------------------------------------------------
 # SOURCE FILE CONFIGURATION
 # --------------------------------------------------
-# silver_sql_file points to a standalone SQL file in SQL_DIR.
-# The SQL files remain separate from Python DAG code.
 
 SOURCE_CONFIG = [
     {
