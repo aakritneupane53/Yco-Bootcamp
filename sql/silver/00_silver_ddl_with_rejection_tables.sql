@@ -16,10 +16,8 @@
 
 USE DATABASE RETAIL_DB;
 
-CREATE SCHEMA IF NOT EXISTS SILVER
-    COMMENT = 'Cleaned and typed retail source data';
 
-USE SCHEMA SILVER;
+USE SCHEMA TMP;
 
 -- ------------------------------------------------------------
 -- 1. ITEM MASTER
