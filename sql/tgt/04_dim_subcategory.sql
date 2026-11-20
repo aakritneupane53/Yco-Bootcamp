@@ -1,0 +1,113 @@
+-- DIM_SUBCATEGORY (SCD1).
+-- Retain every category/subcategory combination found across ALL
+-- historical item snapshots. The business key is scoped by CATEGORY_ID.
+
+MERGE INTO RETAIL_DB.TGT.DIM_SUBCATEGORY T
+USING (
+    WITH ALL_ROWS AS (
+        SELECT
+            ITEM_ID,
+            CATEGORY_ID,
+            SUBCATEGORY_ID,
+            SUBCATEGORY_NAME,
+            ACTIVE_FLG,
+            SRC_SYS_C,
+            BATCH_ID,
+            SNAPSHOT_DT,
+            UPDATE_TS,
+            SRC_FILE_NM,
+            ROW_NUM
+        FROM RETAIL_DB.TMP.SILVER_ITEM_MASTER
+        WHERE CATEGORY_ID IS NOT NULL
+          AND SUBCATEGORY_ID IS NOT NULL
+    ),
+
+    LATEST_SUBCATEGORY AS (
+        SELECT
+            CATEGORY_ID,
+            SUBCATEGORY_ID,
+            SUBCATEGORY_NAME,
+            SRC_SYS_C,
+            BATCH_ID
+        FROM ALL_ROWS
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY CATEGORY_ID, SUBCATEGORY_ID
+            ORDER BY SNAPSHOT_DT DESC,
+                     UPDATE_TS DESC,
+                     SRC_FILE_NM DESC,
+                     ROW_NUM DESC
+        ) = 1
+    ),
+
+    LATEST_ITEM AS (
+        SELECT
+            ITEM_ID,
+            CATEGORY_ID,
+            SUBCATEGORY_ID,
+            ACTIVE_FLG
+        FROM RETAIL_DB.TMP.SILVER_ITEM_MASTER
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY ITEM_ID
+            ORDER BY SNAPSHOT_DT DESC,
+                     UPDATE_TS DESC,
+                     SRC_FILE_NM DESC,
+                     ROW_NUM DESC
+        ) = 1
+    ),
+
+    SUBCATEGORY_STATUS AS (
+        SELECT
+            CATEGORY_ID,
+            SUBCATEGORY_ID,
+            BOOLOR_AGG(COALESCE(ACTIVE_FLG, FALSE)) AS ACTIVE_FLG
+        FROM LATEST_ITEM
+        WHERE CATEGORY_ID IS NOT NULL
+          AND SUBCATEGORY_ID IS NOT NULL
+        GROUP BY CATEGORY_ID, SUBCATEGORY_ID
+    )
+
+    SELECT
+        N.SUBCATEGORY_ID,
+        N.SUBCATEGORY_NAME AS SUBCATEGORY_NM,
+        C.CATEGORY_KY,
+        COALESCE(S.ACTIVE_FLG, FALSE) AS ACTIVE_FLG,
+        N.SRC_SYS_C,
+        N.BATCH_ID
+    FROM LATEST_SUBCATEGORY N
+    JOIN RETAIL_DB.TGT.DIM_CATEGORY C
+        ON C.CATEGORY_ID = N.CATEGORY_ID
+    LEFT JOIN SUBCATEGORY_STATUS S
+        ON S.CATEGORY_ID = N.CATEGORY_ID
+       AND S.SUBCATEGORY_ID = N.SUBCATEGORY_ID
+
+) S
+ON T.CATEGORY_KY = S.CATEGORY_KY
+AND T.SUBCATEGORY_ID = S.SUBCATEGORY_ID
+
+WHEN MATCHED THEN UPDATE SET
+    T.SUBCATEGORY_NM = S.SUBCATEGORY_NM,
+    T.ACTIVE_FLG = S.ACTIVE_FLG,
+    T.SRC_SYS_C = S.SRC_SYS_C,
+    T.BATCH_ID = S.BATCH_ID,
+    T.UPDATE_TS = CURRENT_TIMESTAMP()
+
+WHEN NOT MATCHED THEN INSERT (
+    SUBCATEGORY_ID,
+    SUBCATEGORY_NM,
+    CATEGORY_KY,
+    ACTIVE_FLG,
+    SRC_SYS_C,
+    BATCH_ID,
+    INSERT_TS,
+    UPDATE_TS
+)
+VALUES (
+    S.SUBCATEGORY_ID,
+    S.SUBCATEGORY_NM,
+    S.CATEGORY_KY,
+    S.ACTIVE_FLG,
+    S.SRC_SYS_C,
+    S.BATCH_ID,
+    CURRENT_TIMESTAMP(),
+    CURRENT_TIMESTAMP()
+);

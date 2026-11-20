@@ -27,6 +27,9 @@ from retail_ingestion_config import (
     INGESTION_LOG,
     SILVER_LOAD_CONTROL,
     SOURCE_CONFIG,
+    TGT_SCHEMA,
+    TGT_SQL_DIR,
+    MARTS_SQL_DIR,
 )
 
 
@@ -341,6 +344,273 @@ def record_silver_failure(
             )
 
 
+
+
+# --------------------------------------------------
+# TGT / MARTS SQL EXECUTION HELPERS
+# --------------------------------------------------
+
+def _tgt_connection():
+    return SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID).get_conn()
+
+
+def _execute_tgt_sql_file(conn, sql_path):
+    """Execute a complete SQL file on one Snowflake session.
+
+    execute_stream is important because some SQL files create and reuse
+    session-scoped temporary tables.
+    """
+    if not sql_path.is_file():
+        raise FileNotFoundError(f"SQL file not found: {sql_path}")
+    sql_text = sql_path.read_text(encoding="utf-8")
+    if not sql_text.strip():
+        raise ValueError(f"SQL file is empty: {sql_path}")
+
+    rows_affected = 0
+    result_rows = []
+    statement_count = 0
+
+    for statement_cursor in conn.execute_stream(
+        StringIO(sql_text), remove_comments=True
+    ):
+        statement_count += 1
+        try:
+            if statement_cursor.description:
+                result_rows = statement_cursor.fetchall()
+            if statement_cursor.rowcount and statement_cursor.rowcount > 0:
+                rows_affected += statement_cursor.rowcount
+        finally:
+            statement_cursor.close()
+
+    if statement_count == 0:
+        raise RuntimeError(f"No executable SQL statements found in {sql_path}")
+    return rows_affected, result_rows
+
+
+def _tgt_control_start(conn, run_id, task_id, target_object, sql_file):
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            f"""
+            MERGE INTO RETAIL_DB.{TGT_SCHEMA}.TGT_LOAD_CONTROL T
+            USING (
+                SELECT %s AS AIRFLOW_RUN_ID, %s AS TASK_ID,
+                       %s AS TARGET_OBJECT, %s AS SQL_FILE_NM
+            ) S
+              ON T.AIRFLOW_RUN_ID = S.AIRFLOW_RUN_ID
+             AND T.TASK_ID = S.TASK_ID
+            WHEN MATCHED THEN UPDATE SET
+                T.TARGET_OBJECT = S.TARGET_OBJECT,
+                T.SQL_FILE_NM = S.SQL_FILE_NM,
+                T.LOAD_STATUS = 'STARTED',
+                T.STARTED_TS = CURRENT_TIMESTAMP(),
+                T.COMPLETED_TS = NULL,
+                T.ROWS_AFFECTED = 0,
+                T.ERROR_MESSAGE = NULL,
+                T.UPDATE_TS = CURRENT_TIMESTAMP()
+            WHEN NOT MATCHED THEN INSERT (
+                CONTROL_ID, AIRFLOW_RUN_ID, TASK_ID, TARGET_OBJECT,
+                SQL_FILE_NM, LOAD_STATUS, STARTED_TS, ROWS_AFFECTED,
+                INSERT_TS, UPDATE_TS
+            ) VALUES (
+                UUID_STRING(), S.AIRFLOW_RUN_ID, S.TASK_ID, S.TARGET_OBJECT,
+                S.SQL_FILE_NM, 'STARTED', CURRENT_TIMESTAMP(), 0,
+                CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+            )
+            """,
+            (run_id, task_id, target_object, sql_file),
+        )
+    finally:
+        cursor.close()
+
+
+def _tgt_control_finish(
+    conn, run_id, task_id, status, rows_affected=0, error_message=None
+):
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            f"""
+            UPDATE RETAIL_DB.{TGT_SCHEMA}.TGT_LOAD_CONTROL
+            SET LOAD_STATUS = %s,
+                COMPLETED_TS = CURRENT_TIMESTAMP(),
+                ROWS_AFFECTED = %s,
+                ERROR_MESSAGE = %s,
+                UPDATE_TS = CURRENT_TIMESTAMP()
+            WHERE AIRFLOW_RUN_ID = %s AND TASK_ID = %s
+            """,
+            (status, rows_affected, error_message, run_id, task_id),
+        )
+    finally:
+        cursor.close()
+
+
+def _run_tgt_controlled_sql(file_name, target_object, sql_dir):
+    context = get_current_context()
+    run_id = context["run_id"][:250]
+    task_id = context["ti"].task_id[:250]
+    sql_path = Path(sql_dir) / file_name
+
+    conn = _tgt_connection()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f"USE WAREHOUSE {WAREHOUSE}")
+        finally:
+            cursor.close()
+
+        _tgt_control_start(conn, run_id, task_id, target_object, file_name)
+        try:
+            rows_affected, _ = _execute_tgt_sql_file(conn, sql_path)
+            _tgt_control_finish(
+                conn, run_id, task_id, "SUCCESS", rows_affected
+            )
+            print(
+                f"Completed {file_name} for {target_object}; "
+                f"reported rows affected={rows_affected}."
+            )
+            return {
+                "file": file_name,
+                "target": target_object,
+                "status": "SUCCESS",
+                "rows_affected": rows_affected,
+            }
+        except Exception as exc:
+            _tgt_control_finish(
+                conn, run_id, task_id, "FAILED", 0, str(exc)[:4000]
+            )
+            raise
+    finally:
+        conn.close()
+
+
+
+def _run_tgt_controlled_validation(file_name, target_object):
+    """
+    Execute a TGT validation SQL file.
+
+    Log each validation result, including diagnostic sample details
+    returned in the third column. Fail the Airflow task when any
+    validation returns a non-zero violation count.
+    """
+    context = get_current_context()
+    run_id = context["run_id"][:250]
+    task_id = context["ti"].task_id[:250]
+    sql_path = Path(TGT_SQL_DIR) / file_name
+
+    conn = _tgt_connection()
+
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f"USE WAREHOUSE {WAREHOUSE}")
+        finally:
+            cursor.close()
+
+        _tgt_control_start(
+            conn,
+            run_id,
+            task_id,
+            target_object,
+            file_name,
+        )
+
+        try:
+            rows_affected, rows = _execute_tgt_sql_file(
+                conn,
+                sql_path,
+            )
+
+            failures = []
+
+            for row in rows:
+                if row is None or len(row) < 2:
+                    continue
+
+                check_name = str(row[0])
+
+                try:
+                    violation_count = int(row[1] or 0)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"Invalid violation count returned by "
+                        f"validation check '{check_name}': {row[1]!r}"
+                    ) from exc
+
+                # Third SQL result column contains diagnostic examples.
+                sample_details = (
+                    str(row[2]).strip()
+                    if len(row) >= 3 and row[2] is not None
+                    else ""
+                )
+
+                # Log every check, including successful checks.
+                print(
+                    f"TGT validation: "
+                    f"{check_name}={violation_count}"
+                )
+
+                if sample_details:
+                    print(
+                        f"TGT validation details "
+                        f"[{check_name}]: {sample_details}"
+                    )
+
+                # Collect failing checks.
+                if violation_count > 0:
+                    failure_detail = (
+                        f"{check_name}={violation_count}"
+                    )
+
+                    if sample_details:
+                        failure_detail += (
+                            f"; samples={sample_details}"
+                        )
+
+                    failures.append(failure_detail)
+
+            if failures:
+                details = "; ".join(failures)
+
+                raise RuntimeError(
+                    f"TGT validation failed: {details}"
+                )
+
+            _tgt_control_finish(
+                conn,
+                run_id,
+                task_id,
+                "SUCCESS",
+                rows_affected,
+            )
+
+            print(
+                f"Validation passed: {file_name}; "
+                f"checks={len(rows)}; "
+                f"rows_affected={rows_affected}"
+            )
+
+            return {
+                "file": file_name,
+                "target": target_object,
+                "status": "SUCCESS",
+                "checks": len(rows),
+            }
+
+        except Exception as exc:
+            _tgt_control_finish(
+                conn,
+                run_id,
+                task_id,
+                "FAILED",
+                0,
+                str(exc)[:4000],
+            )
+            raise
+
+    finally:
+        conn.close()
+
 # --------------------------------------------------
 # DAG
 # --------------------------------------------------
@@ -348,8 +618,8 @@ def record_silver_failure(
 @dag(
     dag_id="retail_stg_ingestion",
     description=(
-        "Wait for the required retail CSV batch, dynamically ingest each file "
-        "into Bronze in parallel, process pending files into Silver, and audit results"
+        "Run the complete retail pipeline: CSV to Bronze, Silver transformations, "
+        "TGT dimensions and facts, monthly mart, and reconciliation"
     ),
     schedule="*/5 * * * *",
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
@@ -360,7 +630,7 @@ def record_silver_failure(
         "retries": 1,
         "retry_delay": timedelta(minutes=2),
     },
-    tags=["retail", "snowflake", "sensors", "dynamic-mapping", "bronze", "silver"],
+    tags=["retail", "snowflake", "sensors", "dynamic-mapping", "bronze", "silver", "tgt", "marts"],
 )
 def retail_stg_ingestion():
 
@@ -1240,7 +1510,81 @@ def retail_stg_ingestion():
         print("Bronze-to-Silver pipeline completed successfully.")
 
     # --------------------------------------------------
-    # TASK DEPENDENCIES: 1 -> 2 -> 3 -> 4 -> 5
+    # 6. TGT READINESS, DIMENSIONS, FACTS, AND RECONCILIATION
+    # --------------------------------------------------
+
+    @task(task_id="check_silver_readiness_for_tgt")
+    def check_silver_readiness_for_tgt():
+        """Block TGT if any required Silver source table is empty."""
+        conn = _tgt_connection()
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(f"USE WAREHOUSE {WAREHOUSE}")
+            finally:
+                cursor.close()
+
+            _, rows = _execute_tgt_sql_file(
+                conn, Path(TGT_SQL_DIR) / "00_check_silver_readiness.sql"
+            )
+            table_counts = {str(row[0]): int(row[1] or 0) for row in rows}
+            empty_tables = [name for name, count in table_counts.items() if count == 0]
+            print(f"Silver readiness counts before TGT: {table_counts}")
+            if empty_tables:
+                raise RuntimeError(
+                    "TGT load blocked because these Silver tables are empty: "
+                    + ", ".join(empty_tables)
+                )
+        finally:
+            conn.close()
+
+    @task(task_id="create_tgt_and_marts_objects")
+    def create_tgt_and_marts_objects():
+        """Create TGT and MARTS schemas/tables after Silver succeeds."""
+        conn = _tgt_connection()
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(f"USE WAREHOUSE {WAREHOUSE}")
+            finally:
+                cursor.close()
+
+            rows_affected, _ = _execute_tgt_sql_file(
+                conn, Path(TGT_SQL_DIR) / "00_tgt_ddl.sql"
+            )
+            print(
+                "TGT and MARTS DDL completed; "
+                f"reported rows affected={rows_affected}."
+            )
+        finally:
+            conn.close()
+
+    @task(task_id="run_tgt_sql")
+    def run_tgt_sql(file_name: str, target_object: str):
+        return _run_tgt_controlled_sql(
+            file_name, target_object, TGT_SQL_DIR
+        )
+
+    @task(task_id="run_marts_sql")
+    def run_marts_sql(file_name: str, target_object: str):
+        return _run_tgt_controlled_sql(
+            file_name, target_object, MARTS_SQL_DIR
+        )
+
+    @task(task_id="validate_tgt_inputs")
+    def validate_tgt_inputs():
+        return _run_tgt_controlled_validation(
+            "10_validate_tgt_inputs.sql", "TGT_INPUT_QUALITY_GATE"
+        )
+
+    @task(task_id="validate_tgt_results")
+    def validate_tgt_results():
+        return _run_tgt_controlled_validation(
+            "14_validate_tgt_results.sql", "TGT_POST_LOAD_QUALITY_GATE"
+        )
+
+    # --------------------------------------------------
+    # TASK DEPENDENCIES: BRONZE -> SILVER -> TGT -> MARTS/AUDIT
     # --------------------------------------------------
 
     connection_test = test_snowflake_connection()
@@ -1257,10 +1601,81 @@ def retail_stg_ingestion():
         silver_execution,
     )
 
+    # Existing Bronze -> Silver workflow (preserved).
     connection_test >> ingestion_log_ready >> file_sensor
     file_sensor >> files_to_map >> mapped_ingestion
     mapped_ingestion >> bronze_ingestion
     bronze_ingestion >> pending_files >> silver_execution >> silver_audit
+
+    # The Gold/TGT branch starts ONLY after the existing Silver audit passes.
+    silver_ready_for_tgt = check_silver_readiness_for_tgt()
+    tgt_ddl = create_tgt_and_marts_objects()
+    silver_audit >> silver_ready_for_tgt >> tgt_ddl
+
+    # Parent / independent dimensions can load in parallel.
+    country = run_tgt_sql.override(task_id="load_dim_country")(
+        "01_dim_country.sql", "DIM_COUNTRY"
+    )
+    category = run_tgt_sql.override(task_id="load_dim_category")(
+        "03_dim_category.sql", "DIM_CATEGORY"
+    )
+    brand = run_tgt_sql.override(task_id="load_dim_brand")(
+        "05_dim_brand.sql", "DIM_BRAND"
+    )
+    customer = run_tgt_sql.override(task_id="load_dim_customer")(
+        "06_dim_customer.sql", "DIM_CUSTOMER"
+    )
+    calendar = run_tgt_sql.override(task_id="seed_calendar_dimensions")(
+        "07_seed_calendar.sql",
+        "DIM_YEAR/DIM_QUARTER/DIM_MONTH/DIM_WEEK/DIM_DAY",
+    )
+
+    for dimension_task in (country, category, brand, customer, calendar):
+        tgt_ddl >> dimension_task
+
+    # Intermediate hierarchy dimensions.
+    region = run_tgt_sql.override(task_id="load_dim_region")(
+        "02_dim_region.sql", "DIM_REGION"
+    )
+    subcategory = run_tgt_sql.override(task_id="load_dim_subcategory")(
+        "04_dim_subcategory.sql", "DIM_SUBCATEGORY"
+    )
+    country >> region
+    category >> subcategory
+
+    # Leaf dimensions that are referenced by detailed facts.
+    store = run_tgt_sql.override(task_id="load_dim_store_scd2")(
+        "08_dim_store.sql", "DIM_STORE"
+    )
+    item = run_tgt_sql.override(task_id="load_dim_item_scd2")(
+        "09_dim_item.sql", "DIM_ITEM"
+    )
+    region >> store
+    subcategory >> item
+    brand >> item
+
+    input_gate = validate_tgt_inputs()
+    for dimension_task in (store, item, customer, calendar):
+        dimension_task >> input_gate
+
+    sale = run_tgt_sql.override(task_id="load_fct_sale")(
+        "11_fct_sale.sql", "FCT_SALE"
+    )
+    inventory = run_tgt_sql.override(task_id="load_fct_inventory")(
+        "12_fct_inventory.sql", "FCT_INVENTORY"
+    )
+    price = run_tgt_sql.override(task_id="load_fct_price")(
+        "13_fct_price.sql", "FCT_PRICE"
+    )
+    input_gate >> [sale, inventory, price]
+
+    monthly_agg = run_marts_sql(
+        "01_agg_product_sales_mon.sql", "AGG_FCT_PRODUCT_SALES_MON"
+    )
+    sale >> monthly_agg
+
+    final_validation = validate_tgt_results()
+    [sale, inventory, price, monthly_agg] >> final_validation
 
 
 retail_stg_ingestion()

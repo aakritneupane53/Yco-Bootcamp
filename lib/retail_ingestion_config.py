@@ -1,12 +1,11 @@
-
 # --------------------------------------------------
 # GENERAL CONFIGURATION
 # --------------------------------------------------
 
 DATA_DIR = "/opt/airflow/data"
 
-# SQL files are mounted from the project-root sql/ directory
-# into every Airflow container at /opt/airflow/sql.
+# Keep SQL_DIR pointed at Silver because the existing Bronze -> Silver
+# tasks use this path. TGT and Marts have their own paths below.
 SQL_DIR = "/opt/airflow/sql/silver"
 
 SNOWFLAKE_CONN_ID = "snowflake_default"
@@ -24,8 +23,7 @@ STAGE = f"{DATABASE}.{BRONZE_SCHEMA}.STG_RETAIL_SOURCE"
 FILE_FORMAT = f"{DATABASE}.{BRONZE_SCHEMA}.FF_RETAIL_CSV"
 INGESTION_LOG = f"{DATABASE}.{BRONZE_SCHEMA}.STG_INGESTION_LOG"
 
-# Backward-compatible alias in case an older DAG
-# still imports SCHEMA.
+# Backward-compatible alias in case an older DAG still imports SCHEMA.
 SCHEMA = BRONZE_SCHEMA
 
 # --------------------------------------------------
@@ -38,6 +36,30 @@ SILVER_LOAD_CONTROL = (
     f"{DATABASE}.{SILVER_SCHEMA}.SILVER_LOAD_CONTROL"
 )
 
+# --------------------------------------------------
+# TGT / GOLD LAYER
+# --------------------------------------------------
+
+TGT_SCHEMA = "TGT"
+TGT_SQL_DIR = "/opt/airflow/sql/tgt"
+
+# --------------------------------------------------
+# MARTS LAYER
+# --------------------------------------------------
+
+MARTS_SCHEMA = "MARTS"
+MARTS_SQL_DIR = "/opt/airflow/sql/marts"
+
+# Silver tables required by the TGT load. These are readiness-check inputs;
+# the TGT transformations still read from RETAIL_DB.TMP.
+SILVER_TABLES = (
+    "SILVER_ITEM_MASTER",
+    "SILVER_STORE_MASTER",
+    "SILVER_CUSTOMER_MASTER",
+    "SILVER_POS_SALES",
+    "SILVER_INVENTORY_SNAPSHOT",
+    "SILVER_PRICE_SNAPSHOT",
+)
 
 # --------------------------------------------------
 # SOURCE FILE CONFIGURATION

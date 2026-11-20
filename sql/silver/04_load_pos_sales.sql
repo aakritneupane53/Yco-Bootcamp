@@ -1,7 +1,6 @@
-
 USE DATABASE RETAIL_DB;
 USE SCHEMA TMP;
-use warehouse RETAIL_WH;
+USE WAREHOUSE RETAIL_WH;
 
 -- ---------------------------------------------------------------------------
 -- 1. Normalize source strings and preserve raw source values for rejection.
@@ -134,79 +133,91 @@ ranked AS (
        AND H.LINE_NUMBER = D.LINE_NUMBER
 )
 SELECT
-    *,
+    R.*,
     CASE
-        WHEN TRANSACTION_ID IS NULL
+        WHEN R.TRANSACTION_ID IS NULL
             THEN 'MISSING_TRANSACTION_ID'
-        WHEN LINE_NUMBER_RAW IS NULL
+        WHEN R.LINE_NUMBER_RAW IS NULL
             THEN 'MISSING_LINE_NUMBER'
-        WHEN LINE_NUMBER IS NULL
+        WHEN R.LINE_NUMBER IS NULL
             THEN 'INVALID_LINE_NUMBER'
-        WHEN BUSINESS_DATE_RAW IS NULL
+        WHEN R.BUSINESS_DATE_RAW IS NULL
             THEN 'MISSING_BUSINESS_DATE'
-        WHEN BUSINESS_DATE IS NULL
+        WHEN R.BUSINESS_DATE IS NULL
             THEN 'INVALID_BUSINESS_DATE'
-        WHEN STORE_ID IS NULL
+        WHEN R.STORE_ID IS NULL
             THEN 'MISSING_STORE_ID'
-        WHEN ITEM_ID IS NULL
+        WHEN R.ITEM_ID IS NULL
             THEN 'MISSING_ITEM_ID'
-        WHEN SALE_DATETIME_RAW IS NOT NULL
-             AND SALE_DATETIME IS NULL
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM RETAIL_DB.TMP.SILVER_STORE_MASTER M
+            WHERE UPPER(TRIM(M.STORE_ID)) = R.STORE_ID
+        )
+            THEN 'UNKNOWN_STORE_ID'
+        WHEN R.SALE_DATETIME_RAW IS NOT NULL
+             AND R.SALE_DATETIME IS NULL
             THEN 'INVALID_SALE_DATETIME'
-        WHEN SOLD_QTY_RAW IS NOT NULL AND SOLD_QTY IS NULL
+        WHEN R.SOLD_QTY_RAW IS NOT NULL AND R.SOLD_QTY IS NULL
             THEN 'INVALID_SOLD_QTY'
-        WHEN SELLING_PRICE_AMT_RAW IS NOT NULL
-             AND SELLING_PRICE_AMT IS NULL
+        WHEN R.SELLING_PRICE_AMT_RAW IS NOT NULL
+             AND R.SELLING_PRICE_AMT IS NULL
             THEN 'INVALID_SELLING_PRICE_AMT'
-        WHEN DISCOUNT_AMT_RAW IS NOT NULL AND DISCOUNT_AMT IS NULL
+        WHEN R.DISCOUNT_AMT_RAW IS NOT NULL AND R.DISCOUNT_AMT IS NULL
             THEN 'INVALID_DISCOUNT_AMT'
-        WHEN SALES_AMT_RAW IS NOT NULL AND SALES_AMT IS NULL
+        WHEN R.SALES_AMT_RAW IS NOT NULL AND R.SALES_AMT IS NULL
             THEN 'INVALID_SALES_AMT'
-        WHEN COST_AMT_RAW IS NOT NULL AND COST_AMT IS NULL
+        WHEN R.COST_AMT_RAW IS NOT NULL AND R.COST_AMT IS NULL
             THEN 'INVALID_COST_AMT'
-        WHEN KEY_ROW_COUNT > 1 AND DISTINCT_PAYLOAD_COUNT > 1
+        WHEN R.KEY_ROW_COUNT > 1 AND R.DISTINCT_PAYLOAD_COUNT > 1
             THEN 'CONFLICTING_DUPLICATE_TRANSACTION_LINE'
-        WHEN KEY_ROW_COUNT > 1 AND DUPLICATE_RN > 1
+        WHEN R.KEY_ROW_COUNT > 1 AND R.DUPLICATE_RN > 1
             THEN 'DUPLICATE_TRANSACTION_LINE'
         ELSE NULL
     END AS REJECT_CODE,
 
     CASE
-        WHEN TRANSACTION_ID IS NULL
+        WHEN R.TRANSACTION_ID IS NULL
             THEN 'TRANSACTION_ID is NULL, empty, or whitespace.'
-        WHEN LINE_NUMBER_RAW IS NULL
+        WHEN R.LINE_NUMBER_RAW IS NULL
             THEN 'LINE_NUMBER is required.'
-        WHEN LINE_NUMBER IS NULL
+        WHEN R.LINE_NUMBER IS NULL
             THEN 'LINE_NUMBER must contain a whole number.'
-        WHEN BUSINESS_DATE_RAW IS NULL
+        WHEN R.BUSINESS_DATE_RAW IS NULL
             THEN 'BUSINESS_DATE is required.'
-        WHEN BUSINESS_DATE IS NULL
+        WHEN R.BUSINESS_DATE IS NULL
             THEN 'BUSINESS_DATE could not be converted using YYYY-MM-DD.'
-        WHEN STORE_ID IS NULL
+        WHEN R.STORE_ID IS NULL
             THEN 'STORE_ID is required.'
-        WHEN ITEM_ID IS NULL
+        WHEN R.ITEM_ID IS NULL
             THEN 'ITEM_ID is required.'
-        WHEN SALE_DATETIME_RAW IS NOT NULL
-             AND SALE_DATETIME IS NULL
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM RETAIL_DB.TMP.SILVER_STORE_MASTER M
+            WHERE UPPER(TRIM(M.STORE_ID)) = R.STORE_ID
+        )
+            THEN 'STORE_ID does not exist in SILVER_STORE_MASTER; the POS row has an unknown store reference.'
+        WHEN R.SALE_DATETIME_RAW IS NOT NULL
+             AND R.SALE_DATETIME IS NULL
             THEN 'SALE_DATETIME could not be converted using YYYY-MM-DD"T"HH24:MI:SS.'
-        WHEN SOLD_QTY_RAW IS NOT NULL AND SOLD_QTY IS NULL
+        WHEN R.SOLD_QTY_RAW IS NOT NULL AND R.SOLD_QTY IS NULL
             THEN 'SOLD_QTY could not be converted to NUMBER(18,3).'
-        WHEN SELLING_PRICE_AMT_RAW IS NOT NULL
-             AND SELLING_PRICE_AMT IS NULL
+        WHEN R.SELLING_PRICE_AMT_RAW IS NOT NULL
+             AND R.SELLING_PRICE_AMT IS NULL
             THEN 'SELLING_PRICE_AMT could not be converted to NUMBER(18,2).'
-        WHEN DISCOUNT_AMT_RAW IS NOT NULL AND DISCOUNT_AMT IS NULL
+        WHEN R.DISCOUNT_AMT_RAW IS NOT NULL AND R.DISCOUNT_AMT IS NULL
             THEN 'DISCOUNT_AMT could not be converted to NUMBER(18,2).'
-        WHEN SALES_AMT_RAW IS NOT NULL AND SALES_AMT IS NULL
+        WHEN R.SALES_AMT_RAW IS NOT NULL AND R.SALES_AMT IS NULL
             THEN 'SALES_AMT could not be converted to NUMBER(18,2).'
-        WHEN COST_AMT_RAW IS NOT NULL AND COST_AMT IS NULL
+        WHEN R.COST_AMT_RAW IS NOT NULL AND R.COST_AMT IS NULL
             THEN 'COST_AMT could not be converted to NUMBER(18,2).'
-        WHEN KEY_ROW_COUNT > 1 AND DISTINCT_PAYLOAD_COUNT > 1
+        WHEN R.KEY_ROW_COUNT > 1 AND R.DISTINCT_PAYLOAD_COUNT > 1
             THEN 'The same TRANSACTION_ID and LINE_NUMBER occur with different normalized transaction-line values.'
-        WHEN KEY_ROW_COUNT > 1 AND DUPLICATE_RN > 1
+        WHEN R.KEY_ROW_COUNT > 1 AND R.DUPLICATE_RN > 1
             THEN 'Exact duplicate transaction line; retained the earliest source row.'
         ELSE NULL
     END AS REJECT_REASON
-FROM ranked;
+FROM ranked R;
 
 -- ---------------------------------------------------------------------------
 -- 2. Start one audit record per source file for this execution.
@@ -323,14 +334,18 @@ WHEN NOT MATCHED THEN INSERT (
 );
 
 -- ---------------------------------------------------------------------------
--- 5. If a business key now has conflicting duplicates, remove any previously
---    loaded Silver row for that transaction line before loading valid rows.
+-- 5. Remove previously loaded Silver rows that are now invalid.
+--    Conflicting transaction-line duplicates must be removed as a grain;
+--    unknown-store rows must not remain in Silver after being quarantined.
 -- ---------------------------------------------------------------------------
 DELETE FROM RETAIL_DB.TMP.SILVER_POS_SALES T
 USING (
     SELECT DISTINCT TRANSACTION_ID, LINE_NUMBER
     FROM TMP_POS_SALES_CLASSIFIED
-    WHERE REJECT_CODE = 'CONFLICTING_DUPLICATE_TRANSACTION_LINE'
+    WHERE REJECT_CODE IN (
+        'CONFLICTING_DUPLICATE_TRANSACTION_LINE',
+        'UNKNOWN_STORE_ID'
+    )
       AND TRANSACTION_ID IS NOT NULL
       AND LINE_NUMBER IS NOT NULL
 ) C
