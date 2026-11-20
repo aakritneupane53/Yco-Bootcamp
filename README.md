@@ -119,7 +119,58 @@ The pipeline includes checks for:
 
 Rejected source rows are kept in rejection tables for review instead of being loaded as valid Silver records.
 
-## 8. Backfill note
+
+
+## 7. Project Setup
+
+**Prerequisites:** Docker Desktop, Docker Compose, a Snowflake account and the project repository.
+
+1. Open a terminal in the project root.
+2. Configure the required environment variables and Snowflake credentials. Do not commit secrets.
+3. Start the services:
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+4. Check the containers:
+
+   ```bash
+   docker compose ps
+   ```
+
+5. In Airflow, configure the Snowflake connection with these settings:
+
+   | Setting | Value |
+   |---|---|
+   | Connection ID | `snowflake_default` |
+   | Database | `RETAIL_DB` |
+   | Warehouse | `RETAIL_WH` |
+
+   Add the Snowflake account, username and authentication details for your environment.
+6. Place the source CSV files in the data directory configured by the project.
+7. Open the Airflow UI and confirm that `retail_stg_ingestion` is visible and has no import errors.
+
+## 8. Run the Pipeline
+
+1. Open the Airflow UI and find `retail_stg_ingestion`.
+2. Enable the DAG if it is paused.
+3. Trigger it manually, or allow its five-minute schedule to run.
+4. Monitor the task graph and check that the final validation and reconciliation tasks succeed.
+
+## 9. Run a Backfill
+
+Airflow backfill creates DAG runs for historical schedule intervals. It runs the DAG's tasks for those intervals.
+
+**Through the Airflow UI:**
+
+1. Open `retail_stg_ingestion` and go to **Backfills**.
+2. Select **Create Backfill**.
+3. Enter the start and end dates, set maximum active runs to `1`, and select the required reprocessing behaviour.
+4. Review the preview and create the backfill.
+5. Monitor the backfill and its DAG runs until they finish.
+
+## 10. Known Backfill Limitations
 
 Airflow backfill creates DAG runs for historical schedule intervals. It does **not** automatically select source files by retail business date. The previously reviewed DAG's file discovery scanned the configured data directory, so confirm that the latest implementation filters files and data by the requested interval before describing it as a business-date backfill. A successful Airflow run alone does not prove historical data was correctly reprocessed.
 

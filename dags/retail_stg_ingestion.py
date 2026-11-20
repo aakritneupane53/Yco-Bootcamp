@@ -33,22 +33,12 @@ from retail_ingestion_config import (
 )
 
 
-# --------------------------------------------------
-# FILE ARRIVAL SENSOR SETTINGS
-# --------------------------------------------------
-# The sensor waits for at least one stable CSV file for EVERY source type
-# declared in SOURCE_CONFIG. It does not check whether files are new or
-# previously ingested: existing files must satisfy the arrival barrier too.
-# Ingestion idempotency is handled separately by the checksum log.
 EXPECTED_SOURCE_TABLES = {item["table"] for item in SOURCE_CONFIG}
 FILE_SENSOR_POKE_INTERVAL_SECONDS = 30
 FILE_SENSOR_TIMEOUT_SECONDS = 60 * 60  # 1 hour
 FILE_STABILITY_SECONDS = 30
 
 
-# --------------------------------------------------
-# HELPERS
-# --------------------------------------------------
 
 def identify_file(filename):
     """Return the source configuration matching a local CSV filename."""
@@ -59,18 +49,12 @@ def identify_file(filename):
 
 
 def sql_string(value):
-    """Quote a value used in a Snowflake SQL string literal."""
+  
     return "'" + str(value).replace("'", "''") + "'"
 
 
 def calculate_file_identity(file_path):
-    """
-    Calculate SHA-256 (our stable file identity), MD5 (for matching files
-    uploaded by the previous version of this DAG), and byte size.
 
-    The stat check avoids ingesting a file while another process is still
-    writing to it.
-    """
     path = Path(file_path)
     stat_before = path.stat()
 
@@ -106,10 +90,7 @@ def calculate_file_identity(file_path):
 
 
 def ensure_ingestion_log_columns(cursor):
-    """
-    Backward-compatible migration for the existing filename-only log table.
-    These statements are safe to run on every DAG execution.
-    """
+
     cursor.execute(
         f"""
         ALTER TABLE {INGESTION_LOG}
@@ -125,14 +106,7 @@ def ensure_ingestion_log_columns(cursor):
 
 
 def legacy_stage_file_matches(cursor, config, filename, file_identity):
-    """
-    Existing successful log rows have no checksum. Before treating such a
-    file as new, compare the local file against the original stage object
-    created by the old DAG (folder/filename).
-
-    If the old staged object's MD5 and size match, backfill the log row and
-    skip the file. If it differs, the local file is a new version.
-    """
+  
     target_table = f"{DATABASE}.{BRONZE_SCHEMA}.{config['table']}"
 
     cursor.execute(
@@ -200,11 +174,7 @@ def legacy_stage_file_matches(cursor, config, filename, file_identity):
 
 
 def count_pending_files(cursor, config):
-    """
-    A Bronze source file is pending if its latest Silver control record is
-    absent, failed, started, or incomplete. A historical SUCCESS does not
-    hide a later FAILED execution.
-    """
+
     bronze_table = (
         f"{DATABASE}.{BRONZE_SCHEMA}.{config['table']}"
     )
@@ -255,7 +225,7 @@ def record_silver_failure(
     airflow_run_id,
     error_message,
 ):
-    """Persist a failed audit state so the file remains pending next run."""
+    
     bronze_table = (
         f"{DATABASE}.{BRONZE_SCHEMA}.{config['table']}"
     )
@@ -346,20 +316,13 @@ def record_silver_failure(
 
 
 
-# --------------------------------------------------
-# TGT / MARTS SQL EXECUTION HELPERS
-# --------------------------------------------------
 
 def _tgt_connection():
     return SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID).get_conn()
 
 
 def _execute_tgt_sql_file(conn, sql_path):
-    """Execute a complete SQL file on one Snowflake session.
 
-    execute_stream is important because some SQL files create and reuse
-    session-scoped temporary tables.
-    """
     if not sql_path.is_file():
         raise FileNotFoundError(f"SQL file not found: {sql_path}")
     sql_text = sql_path.read_text(encoding="utf-8")
@@ -486,13 +449,7 @@ def _run_tgt_controlled_sql(file_name, target_object, sql_dir):
 
 
 def _run_tgt_controlled_validation(file_name, target_object):
-    """
-    Execute a TGT validation SQL file.
 
-    Log each validation result, including diagnostic sample details
-    returned in the third column. Fail the Airflow task when any
-    validation returns a non-zero violation count.
-    """
     context = get_current_context()
     run_id = context["run_id"][:250]
     task_id = context["ti"].task_id[:250]
@@ -611,10 +568,6 @@ def _run_tgt_controlled_validation(file_name, target_object):
     finally:
         conn.close()
 
-# --------------------------------------------------
-# DAG
-# --------------------------------------------------
-
 @dag(
     dag_id="retail_stg_ingestion",
     description=(
@@ -634,9 +587,6 @@ def _run_tgt_controlled_validation(file_name, target_object):
 )
 def retail_stg_ingestion():
 
-    # --------------------------------------------------
-    # 1. TEST SNOWFLAKE CONNECTION
-    # --------------------------------------------------
 
     @task
     def test_snowflake_connection():
@@ -678,9 +628,7 @@ def retail_stg_ingestion():
             cursor.close()
             conn.close()
 
-    # --------------------------------------------------
-    # 2. WAIT FOR THE REQUIRED FILE ARRIVAL BATCH
-    # --------------------------------------------------
+
 
     @task.sensor(
         task_id="wait_for_required_files",
@@ -689,12 +637,7 @@ def retail_stg_ingestion():
         mode="reschedule",
     )
     def wait_for_required_files():
-        """Wait for one stable local CSV file for every configured source type.
 
-        Existing files count, whether or not they were ingested in a previous
-        DAG run. The sensor only checks local file presence/stability; the
-        ingestion task later uses checksums to skip unchanged files.
-        """
         data_path = Path(DATA_DIR)
         if not data_path.is_dir():
             print(f"Waiting for data directory to become available: {DATA_DIR}")
@@ -767,8 +710,6 @@ def retail_stg_ingestion():
             )
             return PokeReturnValue(is_done=False)
 
-        # Map every stable supported file currently present, not just one file
-        # per type. This permits multiple dated snapshots/files for a source.
         ready_file_names = sorted(
             filename
             for filenames in stable_by_source.values()
@@ -783,13 +724,9 @@ def retail_stg_ingestion():
             xcom_value=ready_file_names,
         )
 
-    # --------------------------------------------------
-    # 3. PREPARE THE INGESTION LOG ONCE BEFORE PARALLEL TASKS
-    # --------------------------------------------------
-
     @task
     def prepare_ingestion_log():
-        """Apply the backward-compatible log-column migration once."""
+    
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         conn = hook.get_conn()
         cursor = conn.cursor()
@@ -801,13 +738,10 @@ def retail_stg_ingestion():
             cursor.close()
             conn.close()
 
-    # --------------------------------------------------
-    # 4. DISCOVER FILES TO BE DYNAMICALLY MAPPED
-    # --------------------------------------------------
 
     @task
     def discover_files_for_mapping(sensor_file_names):
-        """Return one mapping payload per ready supported CSV file."""
+      
         data_path = Path(DATA_DIR)
         file_infos = []
 
@@ -845,9 +779,7 @@ def retail_stg_ingestion():
         )
         return file_infos
 
-    # --------------------------------------------------
-    # 5. ONE BRONZE INGESTION TASK PER FILE (DYNAMIC MAPPING)
-    # --------------------------------------------------
+
 
     @task(
         task_id="ingest_single_file",
@@ -875,7 +807,6 @@ def retail_stg_ingestion():
                 "error": f"Local file no longer exists: {file_path}",
             }
 
-        # Recheck stability immediately before reading/uploading the file.
         current_age = time.time() - file_path.stat().st_mtime
         if current_age < FILE_STABILITY_SECONDS:
             return {
@@ -930,9 +861,6 @@ def retail_stg_ingestion():
                     "checksum": file_identity["sha256"],
                     "size_bytes": file_identity["size_bytes"],
                 }
-
-            # Backward compatibility for successful rows created before
-            # checksum columns were introduced.
             if legacy_stage_file_matches(
                 cursor, config, filename, file_identity
             ):
@@ -1070,10 +998,6 @@ def retail_stg_ingestion():
 
         return result
 
-    # --------------------------------------------------
-    # 6. COLLECT RESULTS FROM THE MAPPED INGESTION TASKS
-    # --------------------------------------------------
-
     @task
     def summarize_ingestion(mapped_results):
         # Airflow supplies mapped XCom values as a lazy sequence.
@@ -1107,9 +1031,6 @@ def retail_stg_ingestion():
         )
         return summary
 
-    # --------------------------------------------------
-    # 3. IDENTIFY BRONZE FILES PENDING SILVER PROCESSING
-    # --------------------------------------------------
 
     @task
     def identify_pending_silver_files(ingestion_summary):
@@ -1149,10 +1070,6 @@ def retail_stg_ingestion():
             conn.close()
 
         return pending_sources
-
-    # --------------------------------------------------
-    # 4. EXECUTE CORRESPONDING SILVER SQL FILES
-    # --------------------------------------------------
 
     @task
     def execute_silver_sql_files(pending_sources):
@@ -1210,9 +1127,6 @@ def retail_stg_ingestion():
 
                     statement_count = 0
 
-                    # execute_stream runs statements on this same Snowflake
-                    # connection/session. This is required because the SQL
-                    # scripts create and reuse session temporary tables.
                     for statement_cursor in conn.execute_stream(
                         StringIO(sql_text),
                         remove_comments=True,
@@ -1235,8 +1149,6 @@ def retail_stg_ingestion():
                         finally:
                             statement_cursor.close()
 
-                    # Attach the actual Silver Airflow run to the latest
-                    # successful audit records for the pending files.
                     placeholders = ", ".join(
                         ["%s"] * len(pending_file_names)
                     )
@@ -1275,9 +1187,7 @@ def retail_stg_ingestion():
                         f"{error_message}"
                     )
 
-                    # Persist failure for every file that caused this
-                    # source-table SQL to be selected. These records remain
-                    # pending and are retried on a later DAG run.
+
                     record_silver_failure(
                         audit_cursor,
                         config,
@@ -1299,9 +1209,7 @@ def retail_stg_ingestion():
 
         return result
 
-    # --------------------------------------------------
-    # 5. CONFIRM SILVER PROCESSING AND AUDIT RESULTS
-    # --------------------------------------------------
+
 
     @task
     def confirm_silver_processing(
@@ -1509,13 +1417,8 @@ def retail_stg_ingestion():
 
         print("Bronze-to-Silver pipeline completed successfully.")
 
-    # --------------------------------------------------
-    # 6. TGT READINESS, DIMENSIONS, FACTS, AND RECONCILIATION
-    # --------------------------------------------------
-
     @task(task_id="check_silver_readiness_for_tgt")
     def check_silver_readiness_for_tgt():
-        """Block TGT if any required Silver source table is empty."""
         conn = _tgt_connection()
         try:
             cursor = conn.cursor()
@@ -1540,7 +1443,6 @@ def retail_stg_ingestion():
 
     @task(task_id="create_tgt_and_marts_objects")
     def create_tgt_and_marts_objects():
-        """Create TGT and MARTS schemas/tables after Silver succeeds."""
         conn = _tgt_connection()
         try:
             cursor = conn.cursor()
@@ -1583,9 +1485,6 @@ def retail_stg_ingestion():
             "14_validate_tgt_results.sql", "TGT_POST_LOAD_QUALITY_GATE"
         )
 
-    # --------------------------------------------------
-    # TASK DEPENDENCIES: BRONZE -> SILVER -> TGT -> MARTS/AUDIT
-    # --------------------------------------------------
 
     connection_test = test_snowflake_connection()
     file_sensor = wait_for_required_files()
