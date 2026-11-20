@@ -1,5 +1,14 @@
 -- FCT_SALE: one row per (TRANSACTION_ID, LINE_NUMBER).
 -- Type 2 item/store keys are resolved using the sale business date.
+-- Remove target grain rows no longer present in the Silver source.
+DELETE FROM RETAIL_DB.TGT.FCT_SALE T
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM RETAIL_DB.TMP.SILVER_POS_SALES S
+    WHERE S.TRANSACTION_ID = T.TRANSACTION_ID
+      AND S.LINE_NUMBER = T.LINE_NBR
+);
+
 MERGE INTO RETAIL_DB.TGT.FCT_SALE T
 USING (
     SELECT
