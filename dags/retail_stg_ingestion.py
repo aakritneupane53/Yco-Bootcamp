@@ -484,14 +484,22 @@ def _run_tgt_controlled_sql(file_name, target_object, sql_dir):
         conn.close()
 
 
+
 def _run_tgt_controlled_validation(file_name, target_object):
-    """Fail the Airflow task when a SQL validation returns non-zero counts."""
+    """
+    Execute a TGT validation SQL file.
+
+    Log each validation result, including diagnostic sample details
+    returned in the third column. Fail the Airflow task when any
+    validation returns a non-zero violation count.
+    """
     context = get_current_context()
     run_id = context["run_id"][:250]
     task_id = context["ti"].task_id[:250]
     sql_path = Path(TGT_SQL_DIR) / file_name
 
     conn = _tgt_connection()
+
     try:
         cursor = conn.cursor()
         try:
@@ -499,40 +507,109 @@ def _run_tgt_controlled_validation(file_name, target_object):
         finally:
             cursor.close()
 
-        _tgt_control_start(conn, run_id, task_id, target_object, file_name)
+        _tgt_control_start(
+            conn,
+            run_id,
+            task_id,
+            target_object,
+            file_name,
+        )
+
         try:
-            rows_affected, rows = _execute_tgt_sql_file(conn, sql_path)
-            failures = [
-                (str(row[0]), int(row[1] or 0))
-                for row in rows
-                if len(row) >= 2 and int(row[1] or 0) > 0
-            ]
-            if failures:
-                details = "; ".join(
-                    f"{check_name}={count}"
-                    for check_name, count in failures
+            rows_affected, rows = _execute_tgt_sql_file(
+                conn,
+                sql_path,
+            )
+
+            failures = []
+
+            for row in rows:
+                if row is None or len(row) < 2:
+                    continue
+
+                check_name = str(row[0])
+
+                try:
+                    violation_count = int(row[1] or 0)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"Invalid violation count returned by "
+                        f"validation check '{check_name}': {row[1]!r}"
+                    ) from exc
+
+                # Third SQL result column contains diagnostic examples.
+                sample_details = (
+                    str(row[2]).strip()
+                    if len(row) >= 3 and row[2] is not None
+                    else ""
                 )
-                raise RuntimeError(details)
+
+                # Log every check, including successful checks.
+                print(
+                    f"TGT validation: "
+                    f"{check_name}={violation_count}"
+                )
+
+                if sample_details:
+                    print(
+                        f"TGT validation details "
+                        f"[{check_name}]: {sample_details}"
+                    )
+
+                # Collect failing checks.
+                if violation_count > 0:
+                    failure_detail = (
+                        f"{check_name}={violation_count}"
+                    )
+
+                    if sample_details:
+                        failure_detail += (
+                            f"; samples={sample_details}"
+                        )
+
+                    failures.append(failure_detail)
+
+            if failures:
+                details = "; ".join(failures)
+
+                raise RuntimeError(
+                    f"TGT validation failed: {details}"
+                )
 
             _tgt_control_finish(
-                conn, run_id, task_id, "SUCCESS", rows_affected
+                conn,
+                run_id,
+                task_id,
+                "SUCCESS",
+                rows_affected,
             )
+
             print(
-                f"Validation passed: {file_name}; checks={len(rows)}"
+                f"Validation passed: {file_name}; "
+                f"checks={len(rows)}; "
+                f"rows_affected={rows_affected}"
             )
+
             return {
                 "file": file_name,
                 "target": target_object,
                 "status": "SUCCESS",
+                "checks": len(rows),
             }
+
         except Exception as exc:
             _tgt_control_finish(
-                conn, run_id, task_id, "FAILED", 0, str(exc)[:4000]
+                conn,
+                run_id,
+                task_id,
+                "FAILED",
+                0,
+                str(exc)[:4000],
             )
             raise
+
     finally:
         conn.close()
-
 
 # --------------------------------------------------
 # DAG

@@ -1,4 +1,3 @@
-
 -- DIM_SUBCATEGORY (SCD1).
 -- Retain every category/subcategory combination found across ALL
 -- historical item snapshots. The business key is scoped by CATEGORY_ID.
